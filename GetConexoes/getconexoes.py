@@ -6,15 +6,16 @@ from decimal import Decimal
 from aws_lambda_powertools import Logger, Metrics, Tracer
 from aws_lambda_powertools.metrics import MetricUnit
 
-# 🔹 Inicializa Powertools (Logger, Métricas, Tracing)
-logger = Logger(service="consultas_no_banco")
+# Inicializa Powertools (Logger, Métricas, Tracing)
+logger = Logger(service="consultas_aluno")
 metrics = Metrics(namespace="AplicacaoEducacional", service="consultas_no_banco")  # ✅ Namespace padronizado
 tracer = Tracer(service="consultas_no_banco")
 
-# 🔹 Configuração do Secrets Manager e RDS Proxy
+
+# Configuração do Secrets Manager e RDS Proxy
 secrets_client = boto3.client('secretsmanager', region_name=os.getenv("REGION_NAME"))
 
-# 🔹 Variáveis de ambiente
+# Variáveis de ambiente da Lambda
 SECRET_ARN = os.getenv("SECRET_ARN")  # Secret Manager do banco
 DB_PROXY = os.getenv("DB_PROXY")  # Endpoint do RDS Proxy
 DB_NAME = os.getenv("DB_NAME")  # Nome do banco
@@ -40,7 +41,7 @@ def get_db_credentials():
 
 def convert_decimal_fields(rows):
     """
-    Converte todos os campos Decimal para float antes de serializar em JSON.
+    Converte todos os campos Decimal para float em uma lista de dicionários.
     """
     for row in rows:
         for key, value in row.items():
@@ -53,13 +54,13 @@ def convert_decimal_fields(rows):
 @metrics.log_metrics
 def lambda_handler(event, context):
     """
-    Função Lambda para buscar todos os pagamentos de um aluno específico.
+    Função Lambda para buscar todas as conexões de um aluno.
     """
     try:
         logger.info("Evento recebido", extra={"event": event})
-        tracer.put_annotation("Function", "GetAlunoPagamentos")  # 🔍 Adiciona anotação no X-Ray
+        tracer.put_annotation("Function", "GetAlunoConexoes")  # X-Ray annotation
 
-        # 🔹 Tratamento CORS para requisição OPTIONS
+        # Tratamento CORS para requisição OPTIONS
         if event.get("httpMethod") == "OPTIONS":
             return {
                 "statusCode": 200,
@@ -71,7 +72,7 @@ def lambda_handler(event, context):
                 "body": json.dumps({"message": "CORS OK!"})
             }
 
-        # 🔹 Obtém parâmetros da query string
+        # Obtém parâmetros da query string
         params = event.get("queryStringParameters", {}) or {}
         id_aluno = params.get("id_aluno")
 
@@ -82,13 +83,13 @@ def lambda_handler(event, context):
                 "body": json.dumps({"error": "O parâmetro 'id_aluno' é obrigatório."})
             }
 
-        logger.info(f"Buscando pagamentos para o aluno ID: {id_aluno}")
+        logger.info(f"Buscando conexões para o aluno ID: {id_aluno}")
 
-        # 🔹 Obtém credenciais seguras
+        # Obtém credenciais seguras
         creds = get_db_credentials()
 
-        # 🔹 Consulta pagamentos do aluno no banco de dados
-        pagamentos = consultar_pagamentos_aluno(creds, id_aluno)
+        # Consulta conexões do aluno
+        conexoes = consultar_conexoes_aluno(creds, id_aluno)
 
         return {
             "statusCode": 200,
@@ -98,12 +99,12 @@ def lambda_handler(event, context):
                 "Access-Control-Allow-Headers": "Content-Type",
                 "Content-Type": "application/json"
             },
-            "body": json.dumps(pagamentos)
+            "body": json.dumps(conexoes)
         }
 
     except Exception as e:
         logger.exception("Erro inesperado")
-        tracer.put_annotation("Error", str(e))  # 🔍 Adiciona erro ao X-Ray
+        tracer.put_annotation("Error", str(e))
         return {
             "statusCode": 500,
             "headers": {
@@ -116,9 +117,9 @@ def lambda_handler(event, context):
         }
 
 @tracer.capture_method
-def consultar_pagamentos_aluno(creds, id_aluno):
+def consultar_conexoes_aluno(creds, id_aluno):
     """
-    Executa a consulta SQL para buscar pagamentos do aluno no banco de dados.
+    Executa a consulta SQL para buscar conexões do aluno no banco de dados.
     """
     try:
         conn = pymysql.connect(
@@ -132,22 +133,23 @@ def consultar_pagamentos_aluno(creds, id_aluno):
 
         with conn.cursor() as cursor:
             sql = """
-            SELECT P.id_pagamento, C.id_conexao, P.valor, P.forma_pagamento, P.status_pagamento
-            FROM Pagamentos P
-            JOIN Conexoes_Aluno_Prof C ON P.id_conexao = C.id_conexao
+            SELECT C.id_conexao, P.nome AS professor, M.nome_materia, C.horas_contratadas, C.status
+            FROM Conexoes_Aluno_Prof C
+            JOIN Professores P ON C.id_professor = P.id_professor
+            JOIN Materias M ON C.id_materia = M.id_materia
             WHERE C.id_aluno = %s
             """
             logger.info(f"Executando SQL: {sql} com id_aluno={id_aluno}")
             cursor.execute(sql, (id_aluno,))
-            pagamentos = cursor.fetchall()
+            conexoes = cursor.fetchall()
 
-            # 🔥 Adiciona métrica unificada de leitura no banco
+            # 🔥 Adiciona métrica de leitura no banco
             metrics.add_metric(name="LeituraNoBanco", unit=MetricUnit.Count, value=1)
 
-        logger.info(f"Pagamentos encontrados para aluno {id_aluno}: {pagamentos}")
+        logger.info(f"Conexões encontradas para aluno {id_aluno}: {conexoes}")
 
-        return convert_decimal_fields(pagamentos)
+        return convert_decimal_fields(conexoes)
 
     except Exception as e:
-        logger.error(f"Erro ao buscar pagamentos no banco: {e}")
+        logger.error(f"Erro ao buscar conexões no banco: {e}")
         raise

@@ -2,64 +2,104 @@ import os
 import json
 import pymysql
 import boto3
+from aws_lambda_powertools import Logger, Metrics, Tracer
+from aws_lambda_powertools.metrics import MetricUnit
 
-# Configuração do Secrets Manager e SQS
+# 🔧 Inicializa os componentes do AWS Powertools
+logger = Logger(service="processamento_pagamentos")
+metrics = Metrics(namespace="AplicacaoEducacional", service="consultas_no_banco")  # ✅ Namespace padronizado
+tracer = Tracer(service="processamento_pagamentos")  # 🔍 Habilita o tracing
+
+# 🔒 Configuração do Secrets Manager e SQS
 secrets_client = boto3.client('secretsmanager', region_name=os.getenv("REGION_NAME"))
 sqs = boto3.client('sqs', region_name=os.getenv("REGION_NAME"))
 
-# Variáveis de ambiente configuradas na AWS Lambda
-SECRET_ARN = os.getenv("SECRET_ARN")  # Secret Manager com credenciais do banco
-DB_PROXY = os.getenv("DB_PROXY")  # Endpoint do RDS Proxy
-DB_NAME = os.getenv("DB_NAME")  # Nome do banco de dados
-SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")  # URL da fila do SQS
+# 🔧 Variáveis de ambiente da AWS Lambda
+SECRET_ARN = os.getenv("SECRET_ARN")
+DB_PROXY = os.getenv("DB_PROXY")
+DB_NAME = os.getenv("DB_NAME")
+SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
 
+@tracer.capture_method
 def get_db_credentials():
     """
     Busca as credenciais do banco de dados no AWS Secrets Manager.
     """
     try:
-        print(f"🔍 Buscando credenciais no Secrets Manager ({SECRET_ARN})...")
+        logger.info(f"Buscando credenciais no Secrets Manager ({SECRET_ARN})...")
         response = secrets_client.get_secret_value(SecretId=SECRET_ARN)
         secret = json.loads(response["SecretString"])
-
         return {
-            "host": DB_PROXY,  # Usar o endpoint do RDS Proxy
+            "host": DB_PROXY,
             "user": secret["username"],
             "password": secret["password"],
             "database": DB_NAME,
         }
     except Exception as e:
-        print(f"❌ Erro ao buscar credenciais do Secrets Manager: {e}")
-        return None
+        logger.error(f"Erro ao buscar credenciais do Secrets Manager: {e}")
+        raise  # Propaga erro para análise no CloudWatch e X-Ray
 
+@tracer.capture_lambda_handler  # 🔍 Captura automaticamente a execução da Lambda
+@logger.inject_lambda_context
+@metrics.log_metrics
 def lambda_handler(event, context):
     """
     Função Lambda para registrar um pagamento no banco via RDS Proxy e enviar para SQS.
     """
     try:
-        print(f"📌 Evento recebido: {event}")
+        logger.info("Evento recebido", extra={"event": event})
+        tracer.put_annotation("Function", "GerarPagamento")  # Adiciona anotações no X-Ray
 
-        # Verifica se há um corpo na requisição
+        # ✅ Tratamento de requisição OPTIONS para CORS
+        if event.get("httpMethod") == "OPTIONS":
+            return {
+                "statusCode": 200,
+                "headers": {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "OPTIONS, GET, POST",
+                    "Access-Control-Allow-Headers": "Content-Type",
+                },
+                "body": json.dumps({"message": "CORS OK!"})
+            }
+
+        # 🔍 Verifica se há um corpo na requisição
         if "body" not in event or not event["body"]:
-            return {"statusCode": 400, "body": json.dumps({"error": "Corpo da requisição está vazio."})}
+            return cors_response(400, {"error": "Corpo da requisição está vazio."})
 
-        # Decodifica o JSON recebido
         body = json.loads(event["body"])
-
         id_conexao = body.get("id_conexao")
         valor = body.get("valor")
         forma_pagamento = body.get("forma_pagamento")
 
-        # Valida se todos os campos obrigatórios foram fornecidos
         if not all([id_conexao, valor, forma_pagamento]):
-            return {"statusCode": 400, "body": json.dumps({"error": "Todos os campos são obrigatórios."})}
+            return cors_response(400, {"error": "Todos os campos são obrigatórios."})
 
-        # Obtém credenciais seguras
         creds = get_db_credentials()
         if not creds:
-            return {"statusCode": 500, "body": json.dumps({"error": "Falha ao obter credenciais do banco"})}
+            return cors_response(500, {"error": "Falha ao obter credenciais do banco"})
 
-        # Conectando ao banco via RDS Proxy
+        pagamento_id = processar_pagamento(creds, id_conexao, valor, forma_pagamento)
+
+        # ✅ Registra a métrica personalizada no CloudWatch
+        metrics.add_metric(name="PagamentosRegistrados", unit=MetricUnit.Count, value=1)
+        metrics.add_metric(name="InsertsNoBanco", unit=MetricUnit.Count, value=1)  # 📊 Nova métrica para INSERTs no banco
+
+        return cors_response(201, {
+            "message": "Pagamento registrado e enviado para processamento!",
+            "id_pagamento": pagamento_id
+        })
+
+    except Exception as e:
+        logger.exception("Erro inesperado")
+        tracer.put_annotation("Error", str(e))  # Log de erro no X-Ray
+        return cors_response(500, {"error": str(e)})
+
+@tracer.capture_method  # 🔍 Adiciona tracing detalhado para esta função
+def processar_pagamento(creds, id_conexao, valor, forma_pagamento):
+    """
+    Processa o pagamento e envia mensagem para o SQS.
+    """
+    try:
         conn = pymysql.connect(
             host=creds["host"],
             user=creds["user"],
@@ -70,20 +110,16 @@ def lambda_handler(event, context):
         )
 
         with conn.cursor() as cursor:
-            # Query para inserir o pagamento no banco de dados com status "Pendente"
             sql = """
             INSERT INTO Pagamentos (id_conexao, valor, forma_pagamento, status_pagamento)
             VALUES (%s, %s, %s, 'Pendente')
             """
             cursor.execute(sql, (id_conexao, valor, forma_pagamento))
             conn.commit()
-
-            # Obtém o ID do pagamento gerado
             pagamento_id = cursor.lastrowid
 
-        print(f"✅ Pagamento inserido com ID: {pagamento_id}")
+        logger.info(f"✅ Pagamento inserido com ID: {pagamento_id}")
 
-        # Criar a mensagem para a fila do SQS
         mensagem_sqs = {
             "id_pagamento": pagamento_id,
             "id_conexao": id_conexao,
@@ -92,19 +128,29 @@ def lambda_handler(event, context):
             "status_pagamento": "Pendente"
         }
 
-        print(f"📩 Enviando mensagem para SQS: {mensagem_sqs}")
+        logger.info(f"📩 Enviando mensagem para SQS: {mensagem_sqs}")
 
-        # Envia para a fila do SQS
         sqs.send_message(
             QueueUrl=SQS_QUEUE_URL,
             MessageBody=json.dumps(mensagem_sqs)
         )
 
-        return {
-            "statusCode": 201,
-            "body": json.dumps({"message": "Pagamento registrado e enviado para processamento!", "id_pagamento": pagamento_id})
-        }
+        return pagamento_id
 
     except Exception as e:
-        print(f"❌ Erro inesperado: {e}")
-        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+        logger.error(f"❌ Erro ao processar pagamento: {e}")
+        raise
+
+def cors_response(status_code, body):
+    """
+    Gera uma resposta com CORS para a API Gateway.
+    """
+    return {
+        "statusCode": status_code,
+        "headers": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "OPTIONS, GET, POST",
+            "Access-Control-Allow-Headers": "Content-Type",
+        },
+        "body": json.dumps(body)
+    }
