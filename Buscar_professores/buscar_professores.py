@@ -106,7 +106,7 @@ def buscar_professores_no_banco(creds, materia):
 
         with conn.cursor() as cursor:
             sql = """
-            SELECT P.id_professor, P.nome, P.valor_hora, M.nome_materia
+            SELECT P.id_professor, P.nome, P.valor_hora, M.nome_materia, M.id_materia
             FROM Professores P
             JOIN Conexao_Prof_Materias CPM ON P.id_professor = CPM.id_professor
             JOIN Materias M ON CPM.id_materia = M.id_materia
